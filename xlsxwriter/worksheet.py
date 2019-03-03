@@ -12,33 +12,32 @@ import os
 import re
 import sys
 import tempfile
-
 from collections import defaultdict
 from collections import namedtuple
+from decimal import Decimal
 from warnings import warn
 
+# Package imports.
+from . import xmlwriter
 # Standard packages in Python 2/3 compatibility mode.
 from .compatibility import StringIO
 from .compatibility import force_unicode
 from .compatibility import num_types, str_types
-
-# Package imports.
-from . import xmlwriter
-from .format import Format
 from .drawing import Drawing
+from .exceptions import DuplicateTableName
+from .format import Format
 from .shape import Shape
-from .xmlwriter import XMLwriter
-from .utility import xl_rowcol_to_cell
-from .utility import xl_rowcol_to_cell_fast
+from .utility import datetime_to_excel_datetime
+from .utility import get_sparkline_style
+from .utility import quote_sheetname
+from .utility import supported_datetime
 from .utility import xl_cell_to_rowcol
 from .utility import xl_col_to_name
-from .utility import xl_range
 from .utility import xl_color
-from .utility import get_sparkline_style
-from .utility import supported_datetime
-from .utility import datetime_to_excel_datetime
-from .utility import quote_sheetname
-from .exceptions import DuplicateTableName
+from .utility import xl_range
+from .utility import xl_rowcol_to_cell
+from .utility import xl_rowcol_to_cell_fast
+from .xmlwriter import XMLwriter
 
 
 ###############################################################################
@@ -263,6 +262,7 @@ class Worksheet(xmlwriter.XMLwriter):
         self.original_row_height = 15
         self.default_row_height = 15
         self.default_row_pixels = 20
+        self.default_col_width = 8
         self.default_col_pixels = 64
         self.default_row_zeroed = 0
 
@@ -290,6 +290,8 @@ class Worksheet(xmlwriter.XMLwriter):
         self.filter_cols = {}
         self.filter_type = {}
 
+        self.autofit_col_sizes = {}
+        self.autofit_row_sizes = {}
         self.col_sizes = {}
         self.row_sizes = {}
         self.col_formats = {}
@@ -526,6 +528,9 @@ class Worksheet(xmlwriter.XMLwriter):
         # Store the cell data in the worksheet data table.
         self.table[row][col] = cell_string_tuple(string_index, cell_format)
 
+        self.autofit_col_sizes.setdefault(col, self.default_col_width)
+        self.autofit_row_sizes.setdefault(row, self.default_row_height)
+
         return str_error
 
     @convert_cell_args
@@ -573,6 +578,9 @@ class Worksheet(xmlwriter.XMLwriter):
         # Store the cell data in the worksheet data table.
         self.table[row][col] = cell_number_tuple(number, cell_format)
 
+        self.autofit_col_sizes.setdefault(col, self.default_col_width)
+        self.autofit_row_sizes.setdefault(row, self.default_row_height)
+
         return 0
 
     @convert_cell_args
@@ -610,6 +618,9 @@ class Worksheet(xmlwriter.XMLwriter):
 
         # Store the cell data in the worksheet data table.
         self.table[row][col] = cell_blank_tuple(cell_format)
+
+        self.autofit_col_sizes.setdefault(col, self.default_col_width)
+        self.autofit_row_sizes.setdefault(row, self.default_row_height)
 
         return 0
 
@@ -653,6 +664,9 @@ class Worksheet(xmlwriter.XMLwriter):
 
         # Store the cell data in the worksheet data table.
         self.table[row][col] = cell_formula_tuple(formula, cell_format, value)
+
+        self.autofit_col_sizes.setdefault(col, self.default_col_width)
+        self.autofit_row_sizes.setdefault(row, self.default_row_height)
 
         return 0
 
@@ -766,6 +780,9 @@ class Worksheet(xmlwriter.XMLwriter):
         # Store the cell data in the worksheet data table.
         self.table[row][col] = cell_number_tuple(number, cell_format)
 
+        self.autofit_col_sizes.setdefault(col, self.default_col_width)
+        self.autofit_row_sizes.setdefault(row, self.default_row_height)
+
         return 0
 
     @convert_cell_args
@@ -804,6 +821,9 @@ class Worksheet(xmlwriter.XMLwriter):
 
         # Store the cell data in the worksheet data table.
         self.table[row][col] = cell_boolean_tuple(value, cell_format)
+
+        self.autofit_col_sizes.setdefault(col, self.default_col_width)
+        self.autofit_row_sizes.setdefault(row, self.default_row_height)
 
         return 0
 
@@ -1071,6 +1091,9 @@ class Worksheet(xmlwriter.XMLwriter):
 
         # Store the cell data in the worksheet data table.
         self.table[row][col] = cell_string_tuple(string_index, cell_format)
+
+        self.autofit_col_sizes.setdefault(col, self.default_col_width)
+        self.autofit_row_sizes.setdefault(row, self.default_row_height)
 
         return 0
 
@@ -1557,6 +1580,102 @@ class Worksheet(xmlwriter.XMLwriter):
 
         if hide_unused_rows:
             self.default_row_zeroed = 1
+
+    @convert_column_args
+    def autofit_columns(self, first_col, last_col, max_width=250):
+        """
+        Apply autofit to a worksheet columns.
+
+        Args:
+            first_col:    First column (zero-indexed).
+            last_col:     Last column (zero-indexed). Can be same as first_col.
+            max_width: The max width to autofit to avoid extra long columns.
+
+        Returns:
+             0: Success.
+            -1: Not supported in constant_memory mode.
+            -2: Max width out of bounds. 0<max_width<=250
+            -3: Column out of bounds
+
+        """
+        # Constant Memory Mode not supported
+        if self.constant_memory:
+            return -1
+
+        # Max width too big
+        if max_width > 250 or max_width <= 0:
+            return -2
+
+        # Ensure 2nd col is larger than first.
+        if first_col > last_col:
+            (first_col, last_col) = (last_col, first_col)
+
+        # Check that each column is valid and without storing info.
+        if self._check_dimensions(0, last_col, True, True):
+            return -3
+        if self._check_dimensions(0, first_col, True, True):
+            return -3
+
+        # the str table indexes are created when saving workbook.
+        # Made temporary string table to allow for
+        # indexing to get string
+        if self.str_table is not None:
+            shared_string_array = \
+                sorted(self.str_table.string_table,
+                       key=self.str_table.string_table.__getitem__)
+
+        # Need to check every written value to find max width
+        # This currently checks unneccesary cells
+        # and autofits all columns
+        for column in range(first_col, last_col + 1):
+            curr_width = 0
+            for row in self.autofit_row_sizes:
+                cell_value = self.table.get(row, '').get(column, '')
+                cell_type = type(cell_value)
+                if cell_value == '':
+                    continue
+                elif cell_type is cell_string_tuple:
+                    index = cell_value.string
+                    string = shared_string_array[index]
+                elif cell_type is cell_number_tuple:
+                    number = cell_value.number
+                    cell_format = cell_value.format
+                    string = str(number)
+                    if '.' in string:
+                        string = string.rstrip('0').rstrip('.')
+                    if cell_format and cell_format.num_format != "General":
+                        string = str(cell_format.num_format)
+                    else:
+                        if '.' in string:
+                            # only shows 11 characters by default
+                            string = string[:11].rstrip('0')
+                        else:
+                            if len(string) > 11:
+                                new_number = Decimal(number)
+                                string = format(new_number, '0.5e')
+                                new_number, exponent = string.split('e')
+                                string = new_number.rstrip('0').rstrip('.')
+                                string += 'e' + exponent
+
+                elif cell_type is cell_blank_tuple:
+                    continue  # Default Width
+                elif cell_type is cell_boolean_tuple:
+                    bool = cell_value.boolean
+                    string = 'TRUE' if bool else 'FALSE'
+                elif cell_type is cell_formula_tuple:
+                    # TODO: May be impossible to determine the width of output
+                    continue
+                elif cell_type is cell_arformula_tuple:
+                    # TODO: May be impossible to determine the width of output
+                    continue
+
+                new_width = len(string)
+                if new_width > curr_width:
+                    width = min(new_width, max_width)
+                    # Width was always 0.17 off
+                    self.set_column(column, column, width + 0.17)
+                    curr_width = width
+        return 0
 
     @convert_range_args
     def merge_range(self, first_row, first_col, last_row, last_col,
